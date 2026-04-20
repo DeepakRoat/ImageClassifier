@@ -1,152 +1,140 @@
+# train.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.amp import autocast, GradScaler 
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import numpy as np
+from tqdm import tqdm
+import os
 
-# =========================
-# Config
-# =========================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 32
-EPOCHS = 5
-LR = 0.001
-IMG_SIZE = 128
+from Res18_model import ResNet18_CIFAR 
 
-TRAIN_DIR = "dataset/train"
-VAL_DIR = "dataset/val"
+# ====================== This guard is REQUIRED on Windows ======================
+if __name__ == '__main__':
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-# =========================
-# Data Transforms
-# =========================
-train_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-val_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+    # 1. Initialize the base model
+    model = ResNet18_CIFAR(num_classes=10).to(device)
+    
+    # 2. Check for saved weights and load them BEFORE compiling
+    model_path = "resnet18_best.pth"
+    if os.path.exists(model_path):
+        print(f" Found saved model '{model_path}'. Loading weights...")
+        # weights_only=True is a security best practice for loading PyTorch weights
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+        
+        # Strip the '_orig_mod.' prefix that torch.compile adds to saved weights
+        clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(clean_state_dict)
+        print(" Weights loaded successfully!")
+    else:
+        print(" No saved model found. Training from scratch...")
 
-train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=train_transform)
-val_dataset = datasets.ImageFolder(VAL_DIR, transform=val_transform)
+    # 3. Compile the model
+    model = torch.compile(model, backend="aot_eager")
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # ====================== DATA ======================
+    data_root = r'E:\AI\res'
 
-NUM_CLASSES = len(train_dataset.classes)
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandAugment(num_ops=2, magnitude=9),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
 
-# =========================
-# Model
-# =========================
-class CNN(nn.Module):
-    def __init__(self, num_classes):
-        super(CNN, self).__init__()
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+    trainset = datasets.CIFAR10(root=data_root, train=True, download=False, transform=transform_train)
+    testset  = datasets.CIFAR10(root=data_root, train=False, download=False, transform=transform_test)
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+    # Reduced num_workers + persistent_workers for stability on laptop
+    trainloader = DataLoader(trainset, batch_size=512, shuffle=True, 
+                             num_workers=4, pin_memory=True, persistent_workers=True)
+    testloader  = DataLoader(testset,  batch_size=512, shuffle=False, 
+                             num_workers=4, pin_memory=True)
 
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
+    print(f"Loaded {len(trainset)} training images and {len(testset)} test images")
 
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * (IMG_SIZE//8) * (IMG_SIZE//8), 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
+    # ====================== LOSS + OPTIMIZER ======================
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.0001, momentum=0.9, weight_decay=5e-4)
+    scaler = GradScaler('cuda')                    # Fixed instantiation
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.fc(x)
-        return x
+    # MixUp
+    def mixup_data(x, y, alpha=0.4):
+        lam = np.random.beta(alpha, alpha)
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(device)
+        mixed_x = lam * x + (1 - lam) * x[index]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
 
-model = CNN(NUM_CLASSES).to(DEVICE)
+    # ====================== TRAINING LOOP ======================
+    epochs = 10
+    best_acc = 0.0
 
-# =========================
-# Loss & Optimizer
-# =========================
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}")
+        
+        for inputs, targets in pbar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            if np.random.rand() < 0.5:
+                inputs, targets_a, targets_b, lam = mixup_data(inputs, targets)
+                use_mixup = True
+            else:
+                use_mixup = False
+            
+            optimizer.zero_grad()
+            
+            # Fixed autocast syntax
+            with autocast('cuda'):
+                outputs = model(inputs)
+                if use_mixup:
+                    loss = lam * criterion(outputs, targets_a) + (1 - lam) * criterion(outputs, targets_b)
+                else:
+                    loss = criterion(outputs, targets)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            pbar.set_postfix({"Loss": f"{train_loss/len(trainloader):.4f}"})
+        
+        scheduler.step()
+        
+        # Validation
+        model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for inputs, targets in testloader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        
+        acc = 100. * correct / total
+        print(f"Epoch {epoch+1} - Test Acc: {acc:.2f}%")
+        
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), model_path)
+            print(f"   >>> New best: {best_acc:.2f}% saved!")
 
-# =========================
-# Training Function
-# =========================
-def train():
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    for images, labels in train_loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        _, preds = torch.max(outputs, 1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-    acc = 100 * correct / total
-    return total_loss / len(train_loader), acc
-
-# =========================
-# Validation Function
-# =========================
-def validate():
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-            total_loss += loss.item()
-            _, preds = torch.max(outputs, 1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-    acc = 100 * correct / total
-    return total_loss / len(val_loader), acc
-
-# =========================
-# Main Training Loop
-# =========================
-for epoch in range(EPOCHS):
-    train_loss, train_acc = train()
-    val_loss, val_acc = validate()
-
-    print(f"Epoch [{epoch+1}/{EPOCHS}]")
-    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-    print("-" * 40)
-
-# =========================
-# Save Model
-# =========================
-torch.save(model.state_dict(), "cnn_model.pth")
-print("Model saved!")
+    print(f"\n Training finished! Best accuracy: {best_acc:.2f}%")
